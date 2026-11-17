@@ -1,0 +1,136 @@
+15:45:56.273 [main] WARN com.pinterest.ktlint.cli.internal.KtlintCommandLine -- Lint has found errors than can be autocorrected using 'ktlint --format'
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "originalUriBaseIds": {
+        "%SRCROOT%": {
+          "uri": "file:///home/me/"
+        }
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "../../project/src/Shop.kt",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startColumn": 1,
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Wildcard import"
+          },
+          "ruleId": "standard:no-wildcard-imports"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "../../project/src/Shop.kt",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startColumn": 12,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Newline expected after opening parenthesis"
+          },
+          "ruleId": "standard:class-signature"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "../../project/src/Shop.kt",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startColumn": 32,
+                  "startLine": 5
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Newline expected before closing parenthesis"
+          },
+          "ruleId": "standard:class-signature"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "../../project/src/Shop.kt",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startColumn": 9,
+                  "startLine": 6
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Function name should start with a lowercase letter (except factory methods) and use camel case"
+          },
+          "ruleId": "standard:function-naming"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "../../project/src/Shop.kt",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startColumn": 20,
+                  "startLine": 7
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "A multiline expression should start on a new line"
+          },
+          "ruleId": "standard:multiline-expression-wrapping"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "downloadUri": "https://github.com/pinterest/ktlint/releases/tag/1.8.0",
+          "fullName": "ktlint",
+          "informationUri": "https://github.com/pinterest/ktlint/",
+          "language": "en",
+          "name": "ktlint",
+          "organization": "pinterest",
+          "rules": [
+          ],
+          "semanticVersion": "1.8.0",
+          "version": "1.8.0"
+        }
+      }
+    }
+  ]
+}
+

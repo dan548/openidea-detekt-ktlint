@@ -1,0 +1,17 @@
+# DRAFT for l0ng-ai/openidea-plugins — not submitted.
+# Publisher id is the file name: dan548 publishes dan548.*.
+#
+# Public key: replace the placeholder with the line `openidea-plugin keygen`
+# prints. Daniil generates that key and keeps the private file. This draft
+# does not contain a key, and nothing here was signed.
+#
+# Signature: a first key has no endorsement. `endorsements` is only for a
+# later rotation (`openidea-plugin endorse "<new public key>" --key <old>
+# --publisher dan548`). The package signature is SIGNATURE.json inside the
+# .oiplugin, produced by `openidea-plugin pack`, not a field of this file.
+# PLACEHOLDER_ENDORSEMENT_SIGNATURE = not generated.
+
+name = "dan548"
+owners = ["dan548"]
+keys = ["PLACEHOLDER_PUBLIC_KEY_FROM_openidea-plugin_keygen"]
+revoked-keys = []

@@ -1,0 +1,24 @@
+{
+  "properties": {
+    "detekt": {
+      "type": "boolean",
+      "title": "Enable detekt",
+      "default": true
+    },
+    "ktlint": {
+      "type": "boolean",
+      "title": "Enable ktlint",
+      "default": true
+    },
+    "detektConfig": {
+      "type": "string",
+      "title": "detekt configuration (project-relative; empty: detekt.yml, config/detekt/detekt.yml or .detekt.yml when the project has one)",
+      "default": ""
+    },
+    "buildUponDefaultConfig": {
+      "type": "boolean",
+      "title": "detekt: complete the project's configuration with the default one",
+      "default": true
+    }
+  }
+}

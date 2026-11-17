@@ -1,0 +1,15 @@
+# DRAFT for l0ng-ai/openidea-plugins — not submitted.
+# Copy to plugins/dan548.detekt-ktlint.toml once a signed release exists.
+#
+# `package` is the URL shape from the registry README. That release was not
+# created. Replace `sha256` with `shasum -a 256` of the .oiplugin after
+# `openidea-plugin pack . --key <private> --publisher dan548`.
+# PLACEHOLDER_PACKAGE_SIGNATURE = not generated (it lives in the package).
+
+repository = "https://github.com/dan548/openidea-detekt-ktlint"
+suggest = ["detekt.yml", ".detekt.yml", "config/detekt/detekt.yml", "config/detekt.yml"]
+
+[[versions]]
+version = "0.1.0"
+package = "https://github.com/dan548/openidea-detekt-ktlint/releases/download/v0.1.0/dan548.detekt-ktlint-0.1.0.oiplugin"
+sha256 = "PLACEHOLDER_SHA256_OF_THE_SIGNED_OIPLUGIN"

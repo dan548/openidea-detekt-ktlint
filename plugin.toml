@@ -1,0 +1,38 @@
+id = "dan548.detekt-ktlint"
+name = "detekt + ktlint"
+version = "0.1.0"
+description = "Checks Kotlin files with detekt and ktlint after saves, quick fixes and other disk changes: both tools' SARIF reports become problems in the editor and the Problems view, with quick fixes that suppress a rule for the declaration or the whole file."
+authors = ["dan548"]
+homepage = "https://github.com/dan548/openidea-detekt-ktlint"
+license = "Apache-2.0"
+change-notes = "0.1.0 — first release: detekt and ktlint after saves and disk changes (including quick fixes and undo), the project's detekt.yml and .editorconfig, @Suppress quick fixes."
+categories = ["linters"]
+# plugin_dir and files-changed arrived in API 1.3. This package is built with
+# the v0.1.47 SDK (openidea:plugin@1.10.0), so an older IDE cannot link it.
+engines.openidea = "^1.10"
+wasm = "dist/plugin.wasm"
+activation = ["on-event:file-saved", "on-event:files-changed", "on-command:*"]
+
+[capabilities]
+required = ["project.read", "events", "storage"]
+# Each tool is optional: with only one installed (`brew install detekt ktlint`)
+# or granted, the other one is skipped.
+optional = ["process:detekt", "process:ktlint"]
+
+[[contributes.providers]]
+kinds = ["code-actions"]
+languages = ["kotlin"]
+
+[[contributes.commands]]
+id = "check"
+title = "detekt + ktlint: Check Current File"
+category = "Kotlin Lint"
+
+[[contributes.commands]]
+id = "clear"
+title = "detekt + ktlint: Clear Problems of Current File"
+category = "Kotlin Lint"
+
+[contributes.settings]
+title = "detekt + ktlint"
+schema = "settings.schema.json"
