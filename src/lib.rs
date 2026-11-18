@@ -431,6 +431,41 @@ mod tests {
         assert!(p.code_actions(&doc(), line(1)).is_empty());
     }
 
+    #[test]
+    fn file_quick_fix_follows_multiline_annotations() {
+        for annotation in [
+            "@file:OptIn(\n    kotlin.ExperimentalStdlibApi::class,\n)\n",
+            concat!(
+                "@file:Example(\n",
+                "    \"escaped \\\" )\", // )\n",
+                "    /* outer /* nested */ ) */\n",
+                "    \"\"\"raw\n)\n\"\"\",\n",
+                "    Nested(')'),\n",
+                ")\n",
+            ),
+        ] {
+            let host = host(&ALL);
+            let mut doc = doc();
+            doc.text.insert_str(0, annotation);
+            host.add_file("src/A.kt", &doc.text);
+            let offset = annotation.lines().count();
+            let report = DETEKT
+                .replace("\"startLine\":5", &format!("\"startLine\":{}", 5 + offset))
+                .replace("\"endLine\":5", &format!("\"endLine\":{}", 5 + offset));
+            host.add_external_file(&report_path(), &report);
+            let mut plugin = KotlinLint::default();
+            plugin.handle_events(&[Event::FileSaved(doc.path.clone())], &host.invocation());
+
+            let actions = plugin.code_actions(&doc, line(4 + offset as u32));
+            let fix = actions.iter().find(|action| action.title == "detekt: Suppress MagicNumber in file").unwrap();
+            let edit = &fix.edits[0].1[0];
+            let start = openidea_plugin::text::offset(&doc.text, edit.range.start).unwrap();
+            let end = openidea_plugin::text::offset(&doc.text, edit.range.end).unwrap();
+            doc.text.replace_range(start..end, &edit.text);
+            assert_eq!(doc.text, format!("{annotation}@file:Suppress(\"MagicNumber\")\n\n{TEXT}"));
+        }
+    }
+
     fn disk_change(path: &str) -> Event {
         Event::FilesChanged(openidea_plugin::FilesChanged { modified: vec![path.into()], ..Default::default() })
     }

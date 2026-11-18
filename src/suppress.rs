@@ -259,13 +259,87 @@ pub fn for_declaration(text: &str, decl: &Declaration, id: &str) -> Suppression 
     Suppression::Edit(TextEdit { range: Range::new(pos, pos), text })
 }
 
+/// Counts the extra lines occupied by a file annotation's argument list.
+fn file_annotation_lines(annotation: &str) -> usize {
+    let name_len =
+        annotation.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.'))).unwrap_or(annotation.len());
+    let after_name = &annotation[name_len..];
+    let args = after_name.trim_start();
+    let Some((open, close)) = args.chars().next().and_then(|c| match c {
+        '(' => Some(('(', ')')),
+        '[' => Some(('[', ']')),
+        _ => None,
+    }) else {
+        return 0;
+    };
+
+    let mut rest = args;
+    let mut depth = 0;
+    let mut block_comments = 0;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("/*") {
+            block_comments += 1;
+            rest = tail;
+            continue;
+        }
+        if block_comments > 0 {
+            if let Some(tail) = rest.strip_prefix("*/") {
+                block_comments -= 1;
+                rest = tail;
+            } else {
+                rest = &rest[rest.chars().next().unwrap().len_utf8()..];
+            }
+            continue;
+        }
+        if rest.starts_with("//") {
+            rest = rest.find('\n').map_or("", |end| &rest[end..]);
+            continue;
+        }
+        if let Some(raw) = rest.strip_prefix("\"\"\"") {
+            rest = raw.find("\"\"\"").map_or("", |end| &raw[end + 3..]);
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        rest = &rest[c.len_utf8()..];
+        if matches!(c, '"' | '\'') {
+            let mut chars = rest.char_indices();
+            let mut end = rest.len();
+            while let Some((at, ch)) = chars.next() {
+                if ch == '\\' {
+                    chars.next();
+                } else if ch == c {
+                    end = at + ch.len_utf8();
+                    break;
+                }
+            }
+            rest = &rest[end..];
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    after_name[..after_name.len() - rest.len()].bytes().filter(|&b| b == b'\n').count()
+}
+
 /// Suppresses `id` in the whole file: `@file:Suppress` before `package`.
 pub fn for_file(text: &str, id: &str) -> Suppression {
     let lines = lines(text);
     let nl = newline(text);
     let mut in_comment = false;
     let mut insert = lines.len();
-    for (i, line) in lines.iter().enumerate() {
+    let mut annotation_end = 0;
+    let mut offset = 0;
+    for (i, raw) in text.split('\n').enumerate() {
+        let start = offset;
+        offset += raw.len() + 1;
+        if i < annotation_end {
+            continue;
+        }
+        let line = lines[i];
         let t = line.trim();
         if in_comment {
             in_comment = !t.contains("*/");
@@ -278,10 +352,13 @@ pub fn for_file(text: &str, id: &str) -> Suppression {
             in_comment = !rest.contains("*/");
             continue;
         }
-        if t.starts_with("@file:") {
+        if let Some(annotation) = t.strip_prefix("@file:") {
             if let Some((at, prefix)) = find_prefix(line, FILE_SUPPRESS) {
                 return extend(&lines, i, at, prefix, id);
             }
+            let annotation_start = start + indent(line).len() + "@file:".len();
+            debug_assert!(text[annotation_start..].starts_with(annotation));
+            annotation_end = i + 1 + file_annotation_lines(&text[annotation_start..]);
             continue;
         }
         insert = i;
