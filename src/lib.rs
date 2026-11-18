@@ -16,7 +16,8 @@ pub mod suppress;
 use openidea_plugin::host::{self, fs};
 use openidea_plugin::providers::{CodeAction, Document, Providers};
 use openidea_plugin::{
-    Diagnostic, Error, Event, Invocation, NotificationLevel, Plugin, Position, Project, Range, register_plugin,
+    Diagnostic, Error, Event, Invocation, NotificationLevel, Plugin, Position, Project, Range, TextEdit, TextEditor,
+    register_plugin, text,
 };
 use sarif::{Finding, Tool};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,9 @@ use suppress::Suppression;
 const DETEKT_CONFIGS: [&str; 4] = ["detekt.yml", "config/detekt/detekt.yml", "config/detekt.yml", ".detekt.yml"];
 const DETEKT_BASELINES: [&str; 3] = ["config/detekt/baseline.xml", "detekt-baseline.xml", "baseline.xml"];
 
+#[cfg(test)]
+type DetektRunner = fn(&Project, &str) -> Result<Vec<Finding>, Error>;
+
 #[derive(Default)]
 pub struct KotlinLint {
     /// Last findings per file (for quick fixes; rebuilt after disk changes).
@@ -33,6 +37,8 @@ pub struct KotlinLint {
     checked_text: BTreeMap<String, String>,
     /// Tools already reported as unavailable (once per activation).
     warned: BTreeSet<Tool>,
+    #[cfg(test)]
+    detekt_runner: Option<DetektRunner>,
 }
 
 fn is_kotlin(path: &str) -> bool {
@@ -67,6 +73,14 @@ fn failure(tool: Tool, status: Option<i32>, out: &openidea_plugin::ProcessOutput
 }
 
 fn detekt(project: &Project, path: &str) -> Result<Vec<Finding>, Error> {
+    detekt_with(project, path, |args| project.run_process("detekt", args, None))
+}
+
+fn detekt_with(
+    project: &Project,
+    path: &str,
+    run: impl FnOnce(&[String]) -> Result<openidea_plugin::ProcessOutput, Error>,
+) -> Result<Vec<Finding>, Error> {
     let report = format!("{}/detekt-report.sarif", fs::plugin_dir()?);
     let mut args = vec!["--input".to_owned(), path.to_owned(), "--report".into(), format!("sarif:{report}")];
     let config = host::setting_string("detektConfig")
@@ -81,12 +95,15 @@ fn detekt(project: &Project, path: &str) -> Result<Vec<Finding>, Error> {
     if let Some(baseline) = DETEKT_BASELINES.iter().find(|b| project.read_file(b).is_ok()) {
         args.extend(["--baseline".into(), (*baseline).to_owned()]);
     }
-    let out = project.run_process("detekt", &args, None)?;
+    fs::write_file(&report, "")?;
+    let out = run(&args)?;
     // 0: clean, 2: findings over `maxIssues`; 1 is an error, 3 an invalid configuration.
-    // Only a successful run writes the report, so an older one is never read as this one.
     match out.status {
         Some(0 | 2) => {
-            let sarif = fs::read_file(&report).map_err(|_| failure(Tool::Detekt, out.status, &out))?;
+            let sarif = fs::read_file(&report)
+                .ok()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| failure(Tool::Detekt, out.status, &out))?;
             sarif::parse(Tool::Detekt, &sarif).map_err(|e| Error::Failed(format!("detekt: {e}")))
         }
         status => Err(failure(Tool::Detekt, status, &out)),
@@ -103,6 +120,45 @@ fn ktlint(project: &Project, path: &str) -> Result<Vec<Finding>, Error> {
         }
         status => Err(failure(Tool::Ktlint, status, &out)),
     }
+}
+
+fn format_with_ktlint(editor: &TextEditor, path: &str) -> Result<Option<String>, Error> {
+    if !is_kotlin(path) {
+        return Err(Error::Invalid(format!("{path} is not a Kotlin file")));
+    }
+    if !enabled(Tool::Ktlint) {
+        return Err(Error::Denied("ktlint is disabled in the plugin settings".into()));
+    }
+    let project = project_of(path).ok_or_else(|| Error::NotFound(format!("{path} is not in an open project")))?;
+    let doc = editor.document()?;
+    if doc.text.is_empty() {
+        return Ok(Some("No formatting changes".into()));
+    }
+
+    let task = host::begin_task("Formatting with ktlint", true);
+    let args = ["--format".into(), "--stdin".into(), format!("--stdin-path={path}"), "--log-level=none".into()];
+    let out = project.run_process("ktlint", &args, Some(&doc.text))?;
+    if task.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    // ktlint can exit 1 with valid output when unfixable violations remain.
+    let empty_ok = out.status == Some(0) && doc.text.trim().is_empty() && out.stderr.is_empty();
+    if !matches!(out.status, Some(0 | 1)) || (out.stdout.is_empty() && !empty_ok) {
+        return Err(failure(Tool::Ktlint, out.status, &out));
+    }
+    // ktlint 1.8.0 can interpret `%` sequences when writing formatted stdin.
+    if doc.text.matches('%').count() != out.stdout.matches('%').count() {
+        return Err(Error::Failed(
+            "ktlint changed percent characters in its output. Use a version with the stdin formatting fix.".into(),
+        ));
+    }
+    if out.stdout == doc.text {
+        return Ok(Some("No formatting changes".into()));
+    }
+
+    let range = Range::new(Position::new(0, 0), text::position(&doc.text, doc.text.len()));
+    editor.apply_edits(doc.version, &[TextEdit { range, text: out.stdout }])?;
+    Ok(Some("Formatted with ktlint".into()))
 }
 
 fn utf16(s: &str) -> u32 {
@@ -162,6 +218,14 @@ fn diagnostic(f: &Finding, text: &str) -> Diagnostic {
 }
 
 impl KotlinLint {
+    fn run_detekt(&self, project: &Project, path: &str) -> Result<Vec<Finding>, Error> {
+        #[cfg(test)]
+        if let Some(run) = self.detekt_runner {
+            return run(project, path);
+        }
+        detekt(project, path)
+    }
+
     fn clear(&mut self, path: &str) -> Result<(), Error> {
         self.findings.remove(path);
         self.checked_text.remove(path);
@@ -173,15 +237,21 @@ impl KotlinLint {
     /// `Err(Cancelled)` when a newer save (or the user) cancelled it.
     fn check(&mut self, path: &str) -> Result<(usize, Vec<String>), Error> {
         let project = project_of(path).ok_or_else(|| Error::NotFound(format!("{path} is not in an open project")))?;
-        self.clear(path)?;
-        let text = project.read_file(path)?;
+        // The CLI tools analyze the file on disk even if an editor holds unsaved changes.
+        let text = project
+            .read_bytes(path)
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|_| Error::Invalid(format!("{path} is not UTF-8"))));
+        if self.checked_text.get(path) != text.as_ref().ok() {
+            self.clear(path)?;
+        }
+        let text = text?;
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
         let task = host::begin_task(&format!("detekt + ktlint: {name}"), true);
         let mut findings = Vec::new();
         let mut failures = Vec::new();
         for tool in [Tool::Detekt, Tool::Ktlint].into_iter().filter(|t| enabled(*t)) {
             let result = match tool {
-                Tool::Detekt => detekt(&project, path),
+                Tool::Detekt => self.run_detekt(&project, path),
                 Tool::Ktlint => ktlint(&project, path),
             };
             if task.is_cancelled() {
@@ -205,7 +275,10 @@ impl KotlinLint {
             }
         }
         // A filesystem batch queued during this run will check the newer contents.
-        if project.read_file(path)? != text {
+        if !project.read_bytes(path).is_ok_and(|bytes| bytes == text.as_bytes()) {
+            if self.checked_text.contains_key(path) {
+                self.clear(path)?;
+            }
             return Err(Error::Stale);
         }
         let diagnostics: Vec<Diagnostic> = findings.iter().map(|f| diagnostic(f, &text)).collect();
@@ -285,6 +358,7 @@ impl Plugin for KotlinLint {
                 self.clear(&path)?;
                 Ok(None)
             }
+            "format" => format_with_ktlint(&editor, &path),
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
     }
@@ -312,10 +386,9 @@ impl Plugin for KotlinLint {
         for (path, saved) in changed {
             // A save and the watcher can report the same write in separate batches.
             if !saved
-                && self
-                    .checked_text
-                    .get(path)
-                    .is_some_and(|text| project_of(path).and_then(|p| p.read_file(path).ok()).as_ref() == Some(text))
+                && self.checked_text.get(path).is_some_and(|text| {
+                    project_of(path).and_then(|p| p.read_bytes(path).ok()).is_some_and(|bytes| bytes == text.as_bytes())
+                })
             {
                 continue;
             }
@@ -362,13 +435,34 @@ mod tests {
         format!("{}/detekt-report.sarif", fs::plugin_dir().unwrap())
     }
 
+    // The mock process returns report contents; the adapter writes them after
+    // the SDK's process callback releases its borrow of the mock filesystem.
+    fn plugin() -> KotlinLint {
+        KotlinLint {
+            detekt_runner: Some(|project, path| {
+                detekt_with(project, path, |args| {
+                    let mut output = project.run_process("detekt", args, None)?;
+                    if matches!(output.status, Some(0 | 2)) && !output.stdout.is_empty() {
+                        fs::write_file(&report_path(), &std::mem::take(&mut output.stdout))?;
+                    }
+                    Ok(output)
+                })
+            }),
+            ..KotlinLint::default()
+        }
+    }
+
+    fn mock_detekt(host: &MockHost, report: impl Into<String>) {
+        let report = report.into();
+        host.on_process("detekt", move |_, _| {
+            Ok(ProcessOutput { status: Some(2), stdout: report.clone(), ..Default::default() })
+        });
+    }
+
     fn host(caps: &[&str]) -> MockHost {
         let host = MockHost::install().with_capabilities(caps);
         host.add_file("src/A.kt", TEXT);
-        host.add_external_file(&report_path(), DETEKT);
-        host.on_process("detekt", |_, _| {
-            Ok(ProcessOutput { status: Some(2), stdout: String::new(), stderr: String::new() })
-        });
+        mock_detekt(&host, DETEKT);
         host.on_process("ktlint", |_, _| {
             Ok(ProcessOutput { status: Some(1), stdout: KTLINT.into(), stderr: String::new() })
         });
@@ -386,7 +480,7 @@ mod tests {
     #[test]
     fn checks_saved_kotlin_files_with_both_tools() {
         let host = host(&ALL);
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         p.handle_events(
             &[Event::FileSaved("/project/src/A.kt".into()), Event::FileSaved("/project/README.md".into())],
             &host.invocation(),
@@ -411,9 +505,114 @@ mod tests {
     }
 
     #[test]
+    fn detekt_requires_a_report_from_the_current_run() {
+        let host = host(&ALL);
+        let mut plugin = plugin();
+        let path = "/project/src/A.kt";
+        assert_eq!(plugin.check(path).unwrap().0, 2);
+        host.on_process("detekt", |_, _| Ok(ProcessOutput { status: Some(0), ..Default::default() }));
+
+        let (findings, failures) = plugin.check(path).unwrap();
+        assert_eq!(findings, 1);
+        assert_eq!(failures, ["detekt: no report (exit 0)"]);
+        assert_eq!(host.diagnostics()[path][0].source.as_deref(), Some("ktlint"));
+    }
+
+    #[test]
+    fn cancelled_rechecks_keep_only_findings_for_the_same_disk_contents() {
+        let host = host(&ALL);
+        let mut plugin = plugin();
+        let mut doc = doc();
+        assert_eq!(plugin.check(&doc.path).unwrap().0, 2);
+        host.on_process("detekt", |_, _| Err(Error::Cancelled));
+
+        assert!(matches!(plugin.check(&doc.path), Err(Error::Cancelled)));
+        assert_eq!(host.diagnostics()[&doc.path].len(), 2);
+        assert_eq!(plugin.code_actions(&doc, line(4)).len(), 2);
+
+        doc.text.insert(0, '\n');
+        host.add_file("src/A.kt", &doc.text);
+        assert!(matches!(plugin.check(&doc.path), Err(Error::Cancelled)));
+        assert!(!host.diagnostics().contains_key(&doc.path));
+        assert!(plugin.code_actions(&doc, line(5)).is_empty());
+    }
+
+    #[test]
+    fn a_check_uses_disk_text_even_if_the_editor_has_unsaved_changes() {
+        let host = host(&ALL);
+        let mut plugin = plugin();
+        let mut doc = doc();
+        doc.text.insert(0, '\n');
+        host.open_editor(&doc.path, "kotlin", &doc.text, &[]);
+
+        assert_eq!(plugin.check(&doc.path).unwrap().0, 2);
+        assert_eq!(host.diagnostics()[&doc.path][0].range.start.line, 4);
+        assert!(plugin.code_actions(&doc, line(4)).is_empty());
+    }
+
+    #[test]
+    fn formats_the_unsaved_kotlin_buffer_as_one_versioned_edit() {
+        let host = host(&["project.read", "editor.read", "editor.write", "process:ktlint"]);
+        let path = "/project/build.gradle.kts";
+        let buffer = "println( \"🧪\" )";
+        let formatted = "println(\"🧪\")\n";
+        host.add_file(path, TEXT);
+        host.open_editor(path, "kotlin", buffer, &[]);
+        host.on_process("ktlint", move |args, stdin| {
+            assert_eq!(args, ["--format", "--stdin", "--stdin-path=/project/build.gradle.kts", "--log-level=none"]);
+            assert_eq!(stdin, Some(buffer));
+            Ok(ProcessOutput { status: Some(1), stdout: formatted.into(), ..Default::default() })
+        });
+        let version = host.editor_version();
+
+        let result = plugin().run_command("format", &host.invocation(), None).unwrap();
+        assert_eq!(result.as_deref(), Some("Formatted with ktlint"));
+        assert_eq!(host.editor_text(), formatted);
+        assert_eq!(host.editor_version(), version + 1);
+        assert_eq!(project_of(path).unwrap().read_bytes(path).unwrap(), TEXT.as_bytes());
+        assert_eq!(host.process_runs()[0].cwd.as_deref(), Some("/project"));
+        assert!(host.tasks()[0].ended);
+    }
+
+    #[test]
+    fn formatting_does_not_apply_missing_corrupted_or_failed_output() {
+        let input = "fun f( ) = \"100%%\"\n";
+        for (status, stdout, stderr) in [
+            (Some(0), "", "Not a valid Kotlin file"),
+            (Some(0), "fun f() = \"100%\"\n", ""),
+            (Some(3), "fun f() = \"100%%\"\n", "ktlint failed"),
+        ] {
+            let host = host(&["project.read", "editor.read", "editor.write", "process:ktlint"]);
+            host.open_editor("/project/src/A.kt", "kotlin", input, &[]);
+            host.on_process("ktlint", move |_, _| {
+                Ok(ProcessOutput { status, stdout: stdout.into(), stderr: stderr.into() })
+            });
+            let version = host.editor_version();
+
+            assert!(matches!(plugin().run_command("format", &host.invocation(), None), Err(Error::Failed(_))));
+            assert_eq!(host.editor_text(), input);
+            assert_eq!(host.editor_version(), version);
+        }
+    }
+
+    #[test]
+    fn already_formatted_text_keeps_its_editor_version() {
+        let host = host(&["project.read", "editor.read", "editor.write", "process:ktlint"]);
+        host.open_editor("/project/src/A.kt", "kotlin", TEXT, &[]);
+        host.on_process("ktlint", |_, _| {
+            Ok(ProcessOutput { status: Some(0), stdout: TEXT.into(), ..Default::default() })
+        });
+        let version = host.editor_version();
+
+        let result = plugin().run_command("format", &host.invocation(), None).unwrap();
+        assert_eq!(result.as_deref(), Some("No formatting changes"));
+        assert_eq!(host.editor_version(), version);
+    }
+
+    #[test]
     fn quick_fixes_suppress_the_rule() {
         let host = host(&ALL);
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         p.handle_events(&[Event::FileSaved("/project/src/A.kt".into())], &host.invocation());
 
         let actions = p.code_actions(&doc(), line(4));
@@ -452,8 +651,8 @@ mod tests {
             let report = DETEKT
                 .replace("\"startLine\":5", &format!("\"startLine\":{}", 5 + offset))
                 .replace("\"endLine\":5", &format!("\"endLine\":{}", 5 + offset));
-            host.add_external_file(&report_path(), &report);
-            let mut plugin = KotlinLint::default();
+            mock_detekt(&host, report);
+            let mut plugin = plugin();
             plugin.handle_events(&[Event::FileSaved(doc.path.clone())], &host.invocation());
 
             let actions = plugin.code_actions(&doc, line(4 + offset as u32));
@@ -473,7 +672,7 @@ mod tests {
     #[test]
     fn quick_fix_disk_write_refreshes_positions_and_undo_restores_findings() {
         let host = host(&ALL);
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         let mut doc = doc();
         p.handle_events(&[Event::FileSaved(doc.path.clone())], &host.invocation());
         let fix = p.code_actions(&doc, line(2)).remove(0);
@@ -488,9 +687,9 @@ mod tests {
         host.on_process("ktlint", |_, _| {
             Ok(ProcessOutput { status: Some(0), stdout: r#"{"runs":[]}"#.into(), ..Default::default() })
         });
-        host.add_external_file(
-            &report_path(),
-            &DETEKT.replace("\"startLine\":5", "\"startLine\":7").replace("\"endLine\":5", "\"endLine\":7"),
+        mock_detekt(
+            &host,
+            DETEKT.replace("\"startLine\":5", "\"startLine\":7").replace("\"endLine\":5", "\"endLine\":7"),
         );
         p.handle_events(&[disk_change(&doc.path)], &host.invocation());
         let d = &host.diagnostics()[&doc.path];
@@ -500,7 +699,7 @@ mod tests {
 
         // Undo is another disk write, with no explicit save event.
         host.add_file("src/A.kt", TEXT);
-        host.add_external_file(&report_path(), DETEKT);
+        mock_detekt(&host, DETEKT);
         host.on_process("ktlint", |_, _| {
             Ok(ProcessOutput { status: Some(1), stdout: KTLINT.into(), ..Default::default() })
         });
@@ -514,7 +713,7 @@ mod tests {
         for path in ["/project/src/A.kt", "/project/src/A.kts"] {
             let host = host(&ALL);
             host.add_file(path, TEXT);
-            let mut p = KotlinLint::default();
+            let mut p = plugin();
             p.handle_events(
                 &[Event::FileSaved(path.into()), disk_change(path), disk_change("/project/README.md")],
                 &host.invocation(),
@@ -547,7 +746,7 @@ mod tests {
         let host = host(&ALL);
         host.add_file("config/detekt/detekt.yml", "style:\n  MagicNumber:\n    active: true\n");
         host.add_file("config/detekt/baseline.xml", "<SmellBaseline/>");
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         p.handle_events(&[Event::FileSaved("/project/src/A.kt".into())], &host.invocation());
         assert_eq!(
             host.process_runs()[0].args[4..],
@@ -569,7 +768,7 @@ mod tests {
     #[test]
     fn a_missing_tool_is_reported_once_and_the_other_still_runs() {
         let host = host(&["project.read", "events", "storage", "process:ktlint"]);
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         for _ in 0..2 {
             p.handle_events(&[Event::FileSaved("/project/src/A.kt".into())], &host.invocation());
         }
@@ -585,7 +784,7 @@ mod tests {
             Ok(ProcessOutput { status: Some(3), stdout: String::new(), stderr: "Invalid config: foo\nat …".into() })
         });
         host.set_setting("ktlint", "false");
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         p.handle_events(&[Event::FileSaved("/project/src/A.kt".into())], &host.invocation());
         assert_eq!(host.process_runs().len(), 1, "ktlint is off");
         assert_eq!(host.notifications()[0].body, "detekt: Invalid config: foo (exit 3)");
@@ -598,13 +797,12 @@ mod tests {
         let text = include_str!("../tests/fixtures/Shop.kt");
         let host = MockHost::install().with_capabilities(&ALL);
         host.add_file("src/Shop.kt", text);
-        host.add_external_file(&report_path(), include_str!("../tests/fixtures/detekt-1.23.8.sarif"));
-        host.on_process("detekt", |_, _| Ok(ProcessOutput { status: Some(2), ..Default::default() }));
+        mock_detekt(&host, include_str!("../tests/fixtures/detekt-1.23.8.sarif"));
         host.on_process("ktlint", |_, _| {
             let stdout = include_str!("../tests/fixtures/ktlint-1.8.0.sarif").to_owned();
             Ok(ProcessOutput { status: Some(1), stdout, stderr: String::new() })
         });
-        let mut p = KotlinLint::default();
+        let mut p = plugin();
         p.handle_events(&[Event::FileSaved("/project/src/Shop.kt".into())], &host.invocation());
         assert!(host.notifications().is_empty(), "{:?}", host.notifications());
         let d = &host.diagnostics()["/project/src/Shop.kt"];

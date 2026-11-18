@@ -2,7 +2,7 @@
 
 Community plugin for [OpenIDEA](https://github.com/l0ng-ai/openidea) (`dan548.detekt-ktlint`). After a Kotlin file is saved, or changed on disk by a quick fix or undo, it runs the detekt and ktlint command-line tools and shows their findings in the editor and the Problems view.
 
-The plugin does not download either tool, and it does not format the file. The only edits it offers are suppression quick fixes.
+Install the CLI tools separately. The plugin offers suppression quick fixes and can format the current editor buffer with ktlint.
 
 ## Install the tools
 
@@ -55,10 +55,17 @@ Commands, under the category **Kotlin Lint**:
 
 - **detekt + ktlint: Check Current File**
 - **detekt + ktlint: Clear Problems of Current File**
+- **Format Current File with ktlint**
 
 Checks also run on their own for `*.kt` and `*.kts` when the file is saved or written on disk.
 
 A detekt run that exits 0 (clean) or 2 (findings) is shown. Exit 1 or 3 is a failed run: the message is the tool’s first output line, and that run adds no problems. ktlint is shown when it exits 0 or 1 and writes a SARIF report; any other result is reported as a failure. One tool failing does not drop the other’s findings.
+
+## Format with ktlint
+
+Use **Format Current File with ktlint** from Search Everywhere › Actions. The command requires ktlint to be enabled and granted `process:ktlint`. It formats the current Kotlin buffer, including unsaved changes, using the file’s `.editorconfig`. The plugin uses `editor.read` and `editor.write` to apply the result in a single Undo step. Saving follows OpenIDEA’s usual save and autosave settings.
+
+ktlint 1.8.0 can corrupt output for files containing `%` when formatting from stdin. The plugin rejects output that loses percent characters. To format affected files, use a [ktlint version with the stdin formatting fix](https://github.com/ktlint/ktlint/pull/3281).
 
 ## Suppression quick fixes
 
@@ -76,6 +83,20 @@ The id inside the annotation is the rule detekt or ktlint actually matches:
 
 An import has no declaration to hang the annotation on, so only the file suppression is offered. Applying a fix writes the file; the plugin checks that new text and moves or drops findings to match it. Undo is another disk change, and the findings come back.
 
+## Screenshots
+
+**Problems view and editor diagnostics**
+
+![OpenIDEA showing detekt and ktlint findings in the editor and Problems view](docs/screenshots/problems.png)
+
+**Suppression quick fixes**
+
+![Intentions menu offering declaration-level and file-level detekt suppression](docs/screenshots/quick-fix.png)
+
+**Per-project settings**
+
+![Plugin settings with detekt enabled and ktlint disabled for the current project](docs/screenshots/settings.png)
+
 ## Build
 
 Rust 1.96 or newer (edition 2024; OpenIDEA 0.1.47’s toolchain) and the `wasm32-wasip2` target:
@@ -92,6 +113,6 @@ openidea-plugin build    # dist/plugin.wasm, then the same checks as Install fro
 
 Load this directory with `openidea-plugin link .`, then Settings › Plugins › Reload. Or use **Install Plugin from Disk…**.
 
-## Registry drafts
+## Marketplace
 
-`drafts/` holds unpublished entries for [l0ng-ai/openidea-plugins](https://github.com/l0ng-ai/openidea-plugins): `drafts/publishers/dan548.toml` and `drafts/plugins/dan548.detekt-ktlint.toml`. The public key and the package SHA-256 are placeholders. Nothing in this repository is signed, and no release is published from here. The publisher generates the key with `openidea-plugin keygen`, keeps the private file, and fills those placeholders in when the package exists. Publishing steps are in that registry’s README.
+Install **detekt + ktlint** from the OpenIDEA Marketplace. Signed packages are attached to this repository’s [releases](https://github.com/dan548/openidea-detekt-ktlint/releases). The [Marketplace registry entry](https://github.com/l0ng-ai/openidea-plugins/blob/main/plugins/dan548.detekt-ktlint.toml) tracks the published versions and their SHA-256 hashes.

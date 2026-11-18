@@ -3,9 +3,8 @@
 //! the annotation on any enclosing declaration. Kotlin's `Suppress` is not
 //! repeatable, so an existing one is extended rather than repeated.
 //!
-//! This reads the text line by line, not a syntax tree: strings and `//`
-//! comments are ignored when counting brackets; a declaration is a line whose
-//! first word after annotations and modifiers is a declaration keyword.
+//! Declaration detection uses bracket balance and indentation. It skips comments
+//! and literals before looking for declaration keywords and annotations.
 
 use openidea_plugin::{Position, Range, TextEdit};
 
@@ -78,32 +77,70 @@ fn indent(line: &str) -> &str {
     &line[..line.len() - line.trim_start().len()]
 }
 
-/// The line without string and character literals and without a `//` comment.
-fn code(line: &str) -> String {
-    let mut out = String::new();
-    let mut chars = line.chars().peekable();
-    let mut quote = None;
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == '\\' {
-                    chars.next();
-                } else if c == q {
-                    quote = None;
+/// Returns the text after a comment or literal at the start of `text`.
+fn after_non_code(text: &str) -> Option<&str> {
+    if text.starts_with("//") {
+        return Some(text.find('\n').map_or("", |end| &text[end..]));
+    }
+    if let Some(mut rest) = text.strip_prefix("/*") {
+        let mut depth = 1;
+        while let Some(at) = rest.find(['/', '*']) {
+            rest = &rest[at..];
+            if let Some(tail) = rest.strip_prefix("/*") {
+                depth += 1;
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix("*/") {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(tail);
                 }
+                rest = tail;
+            } else {
+                rest = &rest[1..];
             }
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == '/' && chars.peek() == Some(&'/') => break,
-            None => out.push(c),
+        }
+        return Some("");
+    }
+    if let Some(rest) = text.strip_prefix("\"\"\"") {
+        return Some(rest.find("\"\"\"").map_or("", |end| rest[end + 3..].trim_start_matches('"')));
+    }
+    let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let rest = &text[1..];
+    let mut chars = rest.char_indices();
+    while let Some((at, c)) = chars.next() {
+        if c == '\n' {
+            return Some(&rest[at..]);
+        }
+        if c == '\\' {
+            chars.next();
+        } else if c == quote {
+            return Some(&rest[at + 1..]);
+        }
+    }
+    Some("")
+}
+
+/// Masks comments and literals while preserving line breaks and byte positions.
+fn code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if let Some(tail) = after_non_code(rest) {
+            out.extend(rest[..rest.len() - tail.len()].bytes().map(|b| match b {
+                b'\r' | b'\n' => char::from(b),
+                _ => ' ',
+            }));
+            rest = tail;
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
         }
     }
     out
 }
 
-/// Brackets the line opens minus those it closes.
 fn balance(line: &str) -> i32 {
-    code(line)
-        .chars()
+    line.chars()
         .map(|c| match c {
             '{' | '(' | '[' => 1,
             '}' | ')' | ']' => -1,
@@ -148,12 +185,12 @@ fn first_word(s: &str) -> (&str, &str) {
 }
 
 /// The declaration `line` starts, if it starts one.
-pub fn declaration(line: &str) -> Option<(&'static str, String)> {
-    let mut rest = skip_annotations(&code(line)).to_owned();
+fn declaration(line: &str) -> Option<(&'static str, String)> {
+    let mut rest = skip_annotations(line);
     loop {
-        let (word, after) = first_word(&rest);
+        let (word, after) = first_word(rest);
         if MODIFIERS.contains(&word) {
-            rest = after.to_owned();
+            rest = after;
             continue;
         }
         let mut keyword = KEYWORDS.iter().copied().find(|k| *k == word)?;
@@ -175,23 +212,32 @@ pub fn declaration(line: &str) -> Option<(&'static str, String)> {
 /// brackets are still open there, or one that continues there more indented.
 pub fn enclosing(text: &str, line: u32) -> Option<Declaration> {
     let lines = lines(text);
-    let l = (line as usize).min(lines.len().checked_sub(1)?);
+    let l = line as usize;
+    lines.get(l)?;
+    let code = code(text);
+    let visible = self::lines(&code);
+    let balances: Vec<_> = visible[..=l].iter().map(|line| balance(line)).collect();
     for k in (0..=l).rev() {
-        let Some((keyword, name)) = declaration(lines[k]) else { continue };
+        // Inserting at the start of a line that begins inside a comment or literal is unsafe.
+        if indent(visible[k]).len() != indent(lines[k]).len() {
+            continue;
+        }
+        let Some((keyword, name)) = declaration(visible[k]) else { continue };
         let found = Declaration { line: k as u32, keyword, name };
         if k == l {
             return Some(found);
         }
         let mut b = 0;
-        if lines[k..l].iter().all(|x| {
-            b += balance(x);
+        if balances[k..l].iter().all(|x| {
+            b += x;
             b > 0
         }) {
             return Some(found);
         }
         let own = indent(lines[k]).len();
-        if balance(lines[k]) == 0
-            && lines[k + 1..=l].iter().filter(|x| !x.trim().is_empty()).all(|x| indent(x).len() > own)
+        if balances[k] == 0
+            && !visible[l].trim().is_empty()
+            && visible[k + 1..=l].iter().filter(|x| !x.trim().is_empty()).all(|x| indent(x).len() > own)
         {
             return Some(found);
         }
@@ -224,33 +270,33 @@ fn extend(lines: &[&str], m: usize, at: usize, prefix: &str, id: &str) -> Suppre
 
 /// Finds one of `prefixes` in the code of `line`: (byte, prefix).
 fn find_prefix(line: &str, prefixes: &[&'static str]) -> Option<(usize, &'static str)> {
-    let code = code(line);
-    // `code` drops literals, so it only confirms the annotation; its place is the line's.
-    prefixes.iter().find(|p| code.contains(**p)).and_then(|p| line.find(p).map(|i| (i, *p)))
+    prefixes.iter().find_map(|p| line.find(p).map(|i| (i, *p)))
 }
 
 /// Suppresses `id` on the declaration `decl`.
 pub fn for_declaration(text: &str, decl: &Declaration, id: &str) -> Suppression {
     let lines = lines(text);
     let k = decl.line as usize;
+    let code = code(text);
+    let visible = self::lines(&code);
     // The annotations above the declaration, and the declaration's line.
     // An annotation's arguments may span lines: `depth` counts the brackets
     // closed below the line read, so the lines inside them belong to it too.
     let mut first = k;
     let mut depth = 0;
     while first > 0 {
-        let t = lines[first - 1].trim_start();
+        let t = visible[first - 1].trim_start();
         if !(depth > 0 || t.starts_with(')') || (t.starts_with('@') && !t.starts_with("@file:"))) {
             break;
         }
-        depth -= balance(lines[first - 1]);
+        depth -= balance(visible[first - 1]);
         if depth < 0 {
             break;
         }
         first -= 1;
     }
-    for m in first..=k {
-        if let Some((at, prefix)) = find_prefix(lines[m], SUPPRESS) {
+    for (m, line) in visible.iter().enumerate().take(k + 1).skip(first) {
+        if let Some((at, prefix)) = find_prefix(line, SUPPRESS) {
             return extend(&lines, m, at, prefix, id);
         }
     }
@@ -275,45 +321,13 @@ fn file_annotation_lines(annotation: &str) -> usize {
 
     let mut rest = args;
     let mut depth = 0;
-    let mut block_comments = 0;
-    while !rest.is_empty() {
-        if let Some(tail) = rest.strip_prefix("/*") {
-            block_comments += 1;
+    while let Some(c) = rest.chars().next() {
+        if let Some(tail) = after_non_code(rest) {
             rest = tail;
             continue;
         }
-        if block_comments > 0 {
-            if let Some(tail) = rest.strip_prefix("*/") {
-                block_comments -= 1;
-                rest = tail;
-            } else {
-                rest = &rest[rest.chars().next().unwrap().len_utf8()..];
-            }
-            continue;
-        }
-        if rest.starts_with("//") {
-            rest = rest.find('\n').map_or("", |end| &rest[end..]);
-            continue;
-        }
-        if let Some(raw) = rest.strip_prefix("\"\"\"") {
-            rest = raw.find("\"\"\"").map_or("", |end| &raw[end + 3..]);
-            continue;
-        }
-        let c = rest.chars().next().unwrap();
         rest = &rest[c.len_utf8()..];
-        if matches!(c, '"' | '\'') {
-            let mut chars = rest.char_indices();
-            let mut end = rest.len();
-            while let Some((at, ch)) = chars.next() {
-                if ch == '\\' {
-                    chars.next();
-                } else if ch == c {
-                    end = at + ch.len_utf8();
-                    break;
-                }
-            }
-            rest = &rest[end..];
-        } else if c == open {
+        if c == open {
             depth += 1;
         } else if c == close {
             depth -= 1;
@@ -353,7 +367,7 @@ pub fn for_file(text: &str, id: &str) -> Suppression {
             continue;
         }
         if let Some(annotation) = t.strip_prefix("@file:") {
-            if let Some((at, prefix)) = find_prefix(line, FILE_SUPPRESS) {
+            if let Some((at, prefix)) = find_prefix(&code(line), FILE_SUPPRESS) {
                 return extend(&lines, i, at, prefix, id);
             }
             let annotation_start = start + indent(line).len() + "@file:".len();
@@ -436,13 +450,32 @@ class Shop(val tax: Int = 20) {
         assert_eq!(declaration("@JvmStatic fun interface Fn {"), Some(("interface", "Fn".into())));
         assert_eq!(declaration("value class Id(val v: Int)"), Some(("class", "Id".into())));
         assert_eq!(declaration("variable = 1"), None);
-        assert_eq!(declaration("// fun commented()"), None);
+        assert_eq!(declaration(&code("// fun commented()")), None);
     }
 
     #[test]
     fn annotates_the_declaration() {
         let out = apply(SRC, for_declaration(SRC, &at(13), "MagicNumber"));
         assert!(out.contains("        @Suppress(\"MagicNumber\")\n        val list = items.map {"), "{out}");
+    }
+
+    #[test]
+    fn ignores_declarations_inside_comments_and_raw_strings() {
+        for comment_or_literal in [
+            "    /* outer\n        /* nested */\n        fun fake() {\n    */\n",
+            "    val template = \"\"\"\n        fun fake() {\n    \"\"\"\n",
+        ] {
+            let src = format!("fun actual() {{\n{comment_or_literal}    println(42)\n}}\n");
+            let finding_line = 1 + comment_or_literal.lines().count() as u32;
+            let decl = enclosing(&src, finding_line).unwrap();
+            assert_eq!((decl.line, decl.name.as_str()), (0, "actual"));
+            assert!(
+                apply(&src, for_declaration(&src, &decl, "MagicNumber"))
+                    .starts_with("@Suppress(\"MagicNumber\")\nfun actual()")
+            );
+        }
+        assert_eq!(enclosing("/*\nfun fake() {\n*/\nprintln(42)\n", 3), None);
+        assert_eq!(enclosing("/*\n*/ fun actual() = 42\n", 1), None);
     }
 
     #[test]
